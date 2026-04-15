@@ -1,30 +1,26 @@
 #!/bin/bash
 #SBATCH --job-name=crl_lowrank
+#SBATCH --account=torch_pr_301_tandon_advanced
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=16G
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=gpu80
 #SBATCH --time 24:00:00
 #SBATCH --output=slurm_logs/slurm-%j.out
-#SBATCH --array=0-2
-
-# Map SLURM array task ID to seeds
-SEEDS=(1000 1001 1002)
-SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
 module purge
 
 # ---- Adjust these variables per experiment ----
 # Override via environment variables when submitting:
-#   ENV_ID=ant_big_maze DEPTH=16 USE_LOW_RANK=1 LOW_RANK_DIM=64 sbatch job_low_rank.slurm
+#   ENV_ID=ant_big_maze DEPTH=16 USE_LOW_RANK=1 LOW_RANK_DIM=64 SEED=1000 sbatch job_low_rank.slurm
 ENV_ID="${ENV_ID:-ant_big_maze}"
 EVAL_ENV_ID="${EVAL_ENV_ID:-ant_big_maze_eval}"
 DEPTH="${DEPTH:-16}"
 USE_LOW_RANK="${USE_LOW_RANK:-0}"
 LOW_RANK_DIM="${LOW_RANK_DIM:-64}"
 LOW_RANK_ACTOR="${LOW_RANK_ACTOR:-0}"
+SEED="${SEED:-1000}"
 # -----------------------------------------------
 
 if [ "$USE_LOW_RANK" -eq 1 ]; then
