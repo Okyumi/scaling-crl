@@ -1,92 +1,93 @@
-# Low-Rank Regularization for Contrastive RL — Experiment Guide
+# LoRA-Style Low-Rank Factorization for Contrastive RL — Experiment Guide
 
-## Overview
+## Research Context
 
-This guide describes experiments to investigate whether **low-rank bottleneck regularization** improves performance of deep residual networks in Contrastive RL (CRL). The technique replaces the standard wide residual MLP in the critic encoders with a bottleneck architecture where the residual blocks operate in a lower-dimensional space.
+The paper "Emergent Low-Rank Training Dynamics in MLPs with Smooth Activations" (arxiv 2602.06208) shows that with smooth activations (SiLU, GELU), training dynamics naturally concentrate in low-rank subspaces. With non-smooth activations (ReLU), dynamics spread over higher-dimensional space.
 
-## Research Questions & Hypotheses
+**Hypothesis**: Since ReLU already learns in a wider subspace, explicitly constraining to low-rank with LoRA factorization may help focus learning and improve sample efficiency. With SiLU, the dynamics are already low-rank so the constraint may be redundant.
 
-### RQ1: Does low-rank regularization improve CRL performance at various depths?
-**Hypothesis**: Low-rank bottleneck architecture will improve or match baseline performance by preventing feature rank collapse in the critic's learned representations. The bottleneck forces the network to learn a more compressed, structured representation.
+## Experiment: Three Baselines
 
-### RQ2: Does low-rank help more with deeper networks?
-**Hypothesis**: Deeper networks (depth 16, 32) may suffer more from feature rank collapse. The low-rank bottleneck should provide larger relative improvements at greater depths compared to shallow networks (depth 4).
+1. **CRL + SiLU** (default baseline): Tests whether the existing smooth-activation CRL naturally benefits from emergent low-rank dynamics
+2. **CRL + ReLU**: Tests CRL with non-smooth activation — expected to have higher-rank training dynamics
+3. **CRL + ReLU + LoRA**: Tests whether explicitly imposing low-rank structure via LoRA factorization helps when using ReLU
 
-### RQ3: What is the optimal bottleneck dimension for CRL?
-**Hypothesis**: There is a sweet spot for `low_rank_dim` — too small loses representational capacity, too large provides insufficient regularization. We expect `low_rank_dim` in the range [32, 128] to work well when `hidden_dim=256`.
+## What the LoRA Factorization Does
 
-### RQ4: Does applying low-rank to the actor help or hurt?
-**Hypothesis**: The critic is the primary learning component in CRL (representations are learned via InfoNCE), so low-rank regularization should primarily benefit the critic. Applying it to the actor may hurt since the actor needs full expressiveness for the policy.
+### Original Full-Rank Architecture (train.py)
 
-## Architecture Description
-
-### Baseline (Full-Rank Residual MLP)
+The SA_encoder, G_encoder, and Actor all follow this pattern:
 ```
-Input → Dense(input_dim → hidden_dim) → LayerNorm → Swish
-     → [Residual Block × (depth // 4)]
-     → Dense(hidden_dim → 64)
-     → Output (64-dim representation)
-
-Residual Block (4 layers):
-    identity = x
-    x → Dense(hidden_dim → hidden_dim) → LayerNorm → Swish  (×4)
-    x = x + identity
+input → Dense(input_dim, m) → LayerNorm → activation → [residual_block × (depth//4)] → Dense(m, output_dim)
 ```
 
-### Low-Rank Bottleneck Variant
+Where `residual_block(x, width, normalize, activation)` does:
 ```
-Input → V: Dense(input_dim → low_rank_dim) → LayerNorm → Swish
-     → [Low-Rank Residual Block × (depth // 4)]  (operates at dim r)
-     → U: Dense(low_rank_dim → hidden_dim) → LayerNorm → Swish
-     → Dense(hidden_dim → 64)
-     → Output (64-dim representation)
-
-Low-Rank Residual Block (4 layers at dim r):
-    identity = x
-    x → Dense(r → r) → LayerNorm → Swish  (×4)
-    x = x + identity
+identity = x
+x = Dense(width, width) → normalize → activation  (×4)
+x = x + identity
 ```
 
-### Key Differences
-- **V projection** (input → bottleneck): Uses epsilon-scaled orthogonal initialization
-- **Residual blocks**: Operate at dimension `r` instead of `hidden_dim` (e.g., 64 instead of 256)
-- **U expansion** (bottleneck → full-rank): Uses epsilon-scaled orthogonal initialization
-- **Parameter count**: Significantly fewer parameters in the residual stack (r² per layer vs m² per layer)
+### LoRA-Factorized Architecture
+
+Each `Dense(m→m)` layer INSIDE the residual blocks is replaced with two factors:
+```
+x → Dense(m, r) → Dense(r, m)   (i.e., x @ B^T @ A^T = x @ (AB)^T)
+```
+
+Key properties:
+- The network still operates at full width `m` everywhere (activations, LayerNorm, skip connections are all dimension `m`)
+- Only the weight matrices are constrained to be rank-r
+- The initial layer `Dense(input→m)` stays full-rank
+- The final output layer `Dense(m→64)` or `Dense(m→action_size)` stays full-rank
+- This is **fundamentally different** from a narrow bottleneck that reduces the hidden dimension
+- Down-projection uses no bias (LoRA convention); up-projection uses bias
+- Initialization: `lecun_uniform` for both factors
+- Total parameter count per factorized layer: `m² + m` → `mr + rm + m = 2mr + m`
+
+### Architecture Diagram
+
+```
+Full-rank residual block:               LoRA-factorized residual block:
+  identity = x                            identity = x
+  x = Dense(m→m)(x)                      x = Dense(m→r, no bias)(x)
+                                          x = Dense(r→m, with bias)(x)
+  x = LayerNorm(x)                       x = LayerNorm(x)
+  x = activation(x)                      x = activation(x)
+  ... (×4 layers)                         ... (×4 layers)
+  x = x + identity                       x = x + identity
+```
 
 ## Config Flags
 
-All new flags are in `train_low_rank.py` and default to preserving baseline behavior:
+All flags are in `train_lora.py` and default to preserving baseline behavior:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--use_low_rank` | int | 0 | Enable low-rank bottleneck in critic encoders (SA and Goal). 0=off (baseline), 1=on. |
-| `--low_rank_dim` | int | 64 | Bottleneck dimension `r`. Only used when `use_low_rank=1`. Controls the width of the residual blocks in the low-rank MLP. |
-| `--low_rank_actor` | int | 0 | Also apply low-rank to the actor network. Only used when `use_low_rank=1`. 0=standard actor, 1=low-rank actor. |
-| `--low_rank_eps` | float | 0.1 | Epsilon for scaled orthogonal init of V and U projection layers. |
+| `--use_low_rank` | int | 0 | Enable LoRA factorization in critic encoder residual blocks. 0=off (baseline), 1=on. |
+| `--low_rank_dim` | int | 64 | Low-rank dimension `r`. Only used when `use_low_rank=1`. Each Dense(m,m) in residual blocks becomes Dense(m,r)→Dense(r,m). |
+| `--use_relu` | int | 0 | Activation function. 0=SiLU/Swish (default), 1=ReLU. |
 
 **Baseline guarantee**: When `--use_low_rank 0` (default), the script uses the exact same `SA_encoder`, `G_encoder`, and `Actor` classes from `train.py`. No code paths in the original `train.py` are modified.
 
 ## File Structure
 
 ```
-scaling-crl-42d56645/
+scaling-crl/
 ├── train.py                          # Original training script (UNMODIFIED)
-├── train_low_rank.py                 # Extended training script with low-rank support
+├── train_lora.py                     # Training script with LoRA support
 ├── networks/
 │   ├── __init__.py                   # Package exports
-│   ├── low_rank_mlp.py               # LowRankMLP: bottleneck residual MLP in Flax
-│   └── low_rank_encoders.py          # LowRankSAEncoder, LowRankGEncoder, LowRankActor
+│   ├── lora_layers.py                # LoRADense: factorized Dense layer
+│   └── lora_encoders.py              # LoraSAEncoder, LoraGEncoder, LoraActor
 ├── buffer.py                         # Replay buffer (UNMODIFIED)
 ├── evaluator.py                      # Evaluation (UNMODIFIED)
 └── envs/                             # Environments (UNMODIFIED)
 ```
 
-## Experiment Design
+## Controlled Variables
 
-### Variables
-
-**Controlled Variables** (fixed across all experiments):
-- Environment: `ant_big_maze` (primary), `arm_push_easy` (secondary)
+Fixed across all experiments:
 - `total_env_steps`: 100,000,000
 - `num_epochs`: 100
 - `num_envs`: 512
@@ -101,226 +102,218 @@ scaling-crl-42d56645/
 - `vis_length`: 1000
 - `save_buffer`: 0
 
-**Independent Variables**:
-- `use_low_rank`: {0, 1}
-- `low_rank_dim`: {32, 64, 128} (when `use_low_rank=1`)
-- `critic_depth` / `actor_depth`: {4, 16, 32}
-- `low_rank_actor`: {0, 1} (secondary experiment)
-- `seed`: {1000, 1001, 1002} (3 seeds per configuration)
+## Dependent Variables (What to Measure)
 
-**Dependent Variables** (measured outcomes):
 - **Time at Goal** (primary metric): fraction of episode the agent spends at the goal
-- **Training curves**: learning progress over env steps
+- **Training curves**: episode return over time (env steps)
+- **Feature rank of learned critic representations**
 - **Wall-clock time**: training time per epoch and total
-- **Critic loss**: InfoNCE loss convergence
 - **Steps per second (SPS)**: throughput metric
 
 ## Run Commands
 
-### Common flags for all ant_big_maze runs:
+### Common flags for ant_big_maze:
 ```bash
 COMMON="--env_id ant_big_maze --eval_env_id ant_big_maze_eval \
   --num_epochs 100 --total_env_steps 100000000 \
   --batch_size 512 --num_envs 512 \
+  --critic_network_width 256 --actor_network_width 256 \
   --actor_skip_connections 4 --critic_skip_connections 4 \
   --vis_length 1000 --save_buffer 0"
 ```
 
-### Experiment 1: Baseline vs Low-Rank at Different Depths (ant_big_maze)
-
-#### Depth 4 — Baseline
-```bash
-uv run train_low_rank.py $COMMON --critic_depth 4 --actor_depth 4 --seed 1000
-uv run train_low_rank.py $COMMON --critic_depth 4 --actor_depth 4 --seed 1001
-uv run train_low_rank.py $COMMON --critic_depth 4 --actor_depth 4 --seed 1002
-```
-
-#### Depth 4 — Low-Rank (r=64)
-```bash
-uv run train_low_rank.py $COMMON --critic_depth 4 --actor_depth 4 --use_low_rank 1 --low_rank_dim 64 --seed 1000
-uv run train_low_rank.py $COMMON --critic_depth 4 --actor_depth 4 --use_low_rank 1 --low_rank_dim 64 --seed 1001
-uv run train_low_rank.py $COMMON --critic_depth 4 --actor_depth 4 --use_low_rank 1 --low_rank_dim 64 --seed 1002
-```
-
-#### Depth 16 — Baseline
-```bash
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --seed 1000
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --seed 1001
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --seed 1002
-```
-
-#### Depth 16 — Low-Rank (r=64)
-```bash
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 64 --seed 1000
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 64 --seed 1001
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 64 --seed 1002
-```
-
-#### Depth 32 — Baseline
-```bash
-uv run train_low_rank.py $COMMON --critic_depth 32 --actor_depth 32 --seed 1000
-uv run train_low_rank.py $COMMON --critic_depth 32 --actor_depth 32 --seed 1001
-uv run train_low_rank.py $COMMON --critic_depth 32 --actor_depth 32 --seed 1002
-```
-
-#### Depth 32 — Low-Rank (r=64)
-```bash
-uv run train_low_rank.py $COMMON --critic_depth 32 --actor_depth 32 --use_low_rank 1 --low_rank_dim 64 --seed 1000
-uv run train_low_rank.py $COMMON --critic_depth 32 --actor_depth 32 --use_low_rank 1 --low_rank_dim 64 --seed 1001
-uv run train_low_rank.py $COMMON --critic_depth 32 --actor_depth 32 --use_low_rank 1 --low_rank_dim 64 --seed 1002
-```
-
-### Experiment 2: Sweep over low_rank_dim (ant_big_maze, depth 16)
-
-#### r=32
-```bash
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 32 --seed 1000
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 32 --seed 1001
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 32 --seed 1002
-```
-
-#### r=64 (already covered in Experiment 1, depth 16)
-
-#### r=128
-```bash
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 128 --seed 1000
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 128 --seed 1001
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 128 --seed 1002
-```
-
-### Experiment 3: Low-Rank Actor (ant_big_maze, depth 16, r=64)
-
-#### Low-rank critic only (already in Experiment 1)
-
-#### Low-rank critic AND actor
-```bash
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 64 --low_rank_actor 1 --seed 1000
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 64 --low_rank_actor 1 --seed 1001
-uv run train_low_rank.py $COMMON --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 64 --low_rank_actor 1 --seed 1002
-```
-
-### Experiment 4: Quick Validation on arm_push_easy
-
+### Common flags for arm_push_easy:
 ```bash
 COMMON_ARM="--env_id arm_push_easy --eval_env_id arm_push_easy \
   --num_epochs 100 --total_env_steps 100000000 \
   --batch_size 512 --num_envs 512 \
+  --critic_network_width 256 --actor_network_width 256 \
   --actor_skip_connections 4 --critic_skip_connections 4 \
   --vis_length 1000 --save_buffer 0"
-
-# Baseline depth 16
-uv run train_low_rank.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --seed 1000
-uv run train_low_rank.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --seed 1001
-
-# Low-rank depth 16 (r=64)
-uv run train_low_rank.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 64 --seed 1000
-uv run train_low_rank.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_low_rank 1 --low_rank_dim 64 --seed 1001
 ```
 
-## Expected Wall-Clock Times (per run)
+---
 
-Based on the paper's Table 7 and SLURM job configuration on A100 GPUs:
+### ant_big_maze — Depth 4
 
-| Environment | Depth | Approx. Time (baseline) | Approx. Time (low-rank) |
-|-------------|-------|------------------------|------------------------|
-| ant_big_maze | 4 | ~2 hours | ~1.5–2 hours (fewer params in residual stack) |
-| ant_big_maze | 16 | ~6 hours | ~4–5 hours |
-| ant_big_maze | 32 | ~12 hours | ~8–10 hours |
-| arm_push_easy | 16 | ~3 hours | ~2–3 hours |
+#### Baseline 1: CRL + SiLU
+```bash
+python train_lora.py $COMMON --critic_depth 4 --actor_depth 4 --use_relu 0 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON --critic_depth 4 --actor_depth 4 --use_relu 0 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON --critic_depth 4 --actor_depth 4 --use_relu 0 --use_low_rank 0 --seed 2
+```
 
-**Note**: Low-rank runs may be faster due to smaller matrix multiplications in the residual blocks (r×r instead of m×m).
+#### Baseline 2: CRL + ReLU
+```bash
+python train_lora.py $COMMON --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 3: CRL + ReLU + LoRA (r=64)
+```bash
+python train_lora.py $COMMON --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 0
+python train_lora.py $COMMON --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 1
+python train_lora.py $COMMON --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 2
+```
+
+---
+
+### ant_big_maze — Depth 16
+
+#### Baseline 1: CRL + SiLU
+```bash
+python train_lora.py $COMMON --critic_depth 16 --actor_depth 16 --use_relu 0 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON --critic_depth 16 --actor_depth 16 --use_relu 0 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON --critic_depth 16 --actor_depth 16 --use_relu 0 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 2: CRL + ReLU
+```bash
+python train_lora.py $COMMON --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 3: CRL + ReLU + LoRA (r=64)
+```bash
+python train_lora.py $COMMON --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 0
+python train_lora.py $COMMON --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 1
+python train_lora.py $COMMON --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 2
+```
+
+---
+
+### ant_big_maze — Depth 32
+
+#### Baseline 1: CRL + SiLU
+```bash
+python train_lora.py $COMMON --critic_depth 32 --actor_depth 32 --use_relu 0 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON --critic_depth 32 --actor_depth 32 --use_relu 0 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON --critic_depth 32 --actor_depth 32 --use_relu 0 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 2: CRL + ReLU
+```bash
+python train_lora.py $COMMON --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 3: CRL + ReLU + LoRA (r=64)
+```bash
+python train_lora.py $COMMON --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 0
+python train_lora.py $COMMON --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 1
+python train_lora.py $COMMON --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 2
+```
+
+---
+
+### arm_push_easy — Depth 4
+
+#### Baseline 1: CRL + SiLU
+```bash
+python train_lora.py $COMMON_ARM --critic_depth 4 --actor_depth 4 --use_relu 0 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON_ARM --critic_depth 4 --actor_depth 4 --use_relu 0 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON_ARM --critic_depth 4 --actor_depth 4 --use_relu 0 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 2: CRL + ReLU
+```bash
+python train_lora.py $COMMON_ARM --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON_ARM --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON_ARM --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 3: CRL + ReLU + LoRA (r=64)
+```bash
+python train_lora.py $COMMON_ARM --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 0
+python train_lora.py $COMMON_ARM --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 1
+python train_lora.py $COMMON_ARM --critic_depth 4 --actor_depth 4 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 2
+```
+
+---
+
+### arm_push_easy — Depth 16
+
+#### Baseline 1: CRL + SiLU
+```bash
+python train_lora.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_relu 0 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_relu 0 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_relu 0 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 2: CRL + ReLU
+```bash
+python train_lora.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 3: CRL + ReLU + LoRA (r=64)
+```bash
+python train_lora.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 0
+python train_lora.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 1
+python train_lora.py $COMMON_ARM --critic_depth 16 --actor_depth 16 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 2
+```
+
+---
+
+### arm_push_easy — Depth 32
+
+#### Baseline 1: CRL + SiLU
+```bash
+python train_lora.py $COMMON_ARM --critic_depth 32 --actor_depth 32 --use_relu 0 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON_ARM --critic_depth 32 --actor_depth 32 --use_relu 0 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON_ARM --critic_depth 32 --actor_depth 32 --use_relu 0 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 2: CRL + ReLU
+```bash
+python train_lora.py $COMMON_ARM --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 0 --seed 0
+python train_lora.py $COMMON_ARM --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 0 --seed 1
+python train_lora.py $COMMON_ARM --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 0 --seed 2
+```
+
+#### Baseline 3: CRL + ReLU + LoRA (r=64)
+```bash
+python train_lora.py $COMMON_ARM --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 0
+python train_lora.py $COMMON_ARM --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 1
+python train_lora.py $COMMON_ARM --critic_depth 32 --actor_depth 32 --use_relu 1 --use_low_rank 1 --low_rank_dim 64 --seed 2
+```
+
+---
 
 ## Total Experiment Budget
 
-| Experiment | Configurations | Seeds | Total Runs |
-|-----------|---------------|-------|------------|
-| Exp 1: Depth scaling | 6 (3 depths × 2 modes) | 3 | 18 |
-| Exp 2: low_rank_dim sweep | 2 (r=32, r=128) | 3 | 6 |
-| Exp 3: Low-rank actor | 1 | 3 | 3 |
-| Exp 4: arm_push_easy | 2 | 2 | 4 |
-| **Total** | | | **31 runs** |
-
-Estimated total GPU-hours: ~150–200 hours on A100.
+| Environment | Depths | Baselines | Seeds | Runs |
+|-------------|--------|-----------|-------|------|
+| ant_big_maze | 3 (4, 16, 32) | 3 (SiLU, ReLU, ReLU+LoRA) | 3 (0, 1, 2) | 27 |
+| arm_push_easy | 3 (4, 16, 32) | 3 (SiLU, ReLU, ReLU+LoRA) | 3 (0, 1, 2) | 27 |
+| **Total** | | | | **54 runs** |
 
 ## SLURM Job Script Template (NYU Torch HPC)
 
-Save as `job_low_rank.slurm`:
-
-```bash
-#!/bin/bash
-#SBATCH --job-name=crl_lowrank
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem-per-cpu=16G
-#SBATCH --gres=gpu:1
-#SBATCH --constraint=gpu80
-#SBATCH --time 24:00:00
-#SBATCH --output=slurm_logs/slurm-%j.out
-#SBATCH --array=0-2
-
-# Map SLURM array task ID to seeds
-SEEDS=(1000 1001 1002)
-SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
-
-module purge
-
-# ---- Adjust these variables per experiment ----
-ENV_ID="ant_big_maze"
-EVAL_ENV_ID="ant_big_maze_eval"
-DEPTH=16
-USE_LOW_RANK=1
-LOW_RANK_DIM=64
-LOW_RANK_ACTOR=0
-# -----------------------------------------------
-
-if [ "$USE_LOW_RANK" -eq 1 ]; then
-    LR_FLAGS="--use_low_rank 1 --low_rank_dim $LOW_RANK_DIM --low_rank_actor $LOW_RANK_ACTOR"
-    LR_TAG="_lowrank${LOW_RANK_DIM}"
-else
-    LR_FLAGS=""
-    LR_TAG="_baseline"
-fi
-
-echo "Running: env=$ENV_ID depth=$DEPTH seed=$SEED low_rank=$USE_LOW_RANK r=$LOW_RANK_DIM"
-
-uv run train_low_rank.py \
-    --env_id "$ENV_ID" \
-    --eval_env_id "$EVAL_ENV_ID" \
-    --num_epochs 100 \
-    --total_env_steps 100000000 \
-    --critic_depth $DEPTH \
-    --actor_depth $DEPTH \
-    --actor_skip_connections 4 \
-    --critic_skip_connections 4 \
-    --batch_size 512 \
-    --num_envs 512 \
-    --vis_length 1000 \
-    --save_buffer 0 \
-    --seed $SEED \
-    $LR_FLAGS
-```
-
-### Submitting experiments:
+See `job_lora.slurm` for the full template. Example submissions:
 
 ```bash
 # Create logs directory
 mkdir -p slurm_logs
 
-# Experiment 1: Baseline depth 16
-ENV_ID="ant_big_maze" DEPTH=16 USE_LOW_RANK=0 sbatch job_low_rank.slurm
+# ant_big_maze, depth 16, CRL + SiLU baseline
+ENV_ID=ant_big_maze DEPTH=16 USE_RELU=0 USE_LOW_RANK=0 sbatch job_lora.slurm
 
-# Experiment 1: Low-rank depth 16 (r=64)
-ENV_ID="ant_big_maze" DEPTH=16 USE_LOW_RANK=1 LOW_RANK_DIM=64 sbatch job_low_rank.slurm
+# ant_big_maze, depth 16, CRL + ReLU baseline
+ENV_ID=ant_big_maze DEPTH=16 USE_RELU=1 USE_LOW_RANK=0 sbatch job_lora.slurm
 
-# Experiment 1: Baseline depth 32
-ENV_ID="ant_big_maze" DEPTH=32 USE_LOW_RANK=0 sbatch job_low_rank.slurm
+# ant_big_maze, depth 16, CRL + ReLU + LoRA (r=64)
+ENV_ID=ant_big_maze DEPTH=16 USE_RELU=1 USE_LOW_RANK=1 LOW_RANK_DIM=64 sbatch job_lora.slurm
 
-# Experiment 1: Low-rank depth 32 (r=64)
-ENV_ID="ant_big_maze" DEPTH=32 USE_LOW_RANK=1 LOW_RANK_DIM=64 sbatch job_low_rank.slurm
-
-# (and so on for each configuration)
+# arm_push_easy, depth 16, CRL + ReLU + LoRA (r=64)
+ENV_ID=arm_push_easy EVAL_ENV_ID=arm_push_easy DEPTH=16 USE_RELU=1 USE_LOW_RANK=1 LOW_RANK_DIM=64 sbatch job_lora.slurm
 ```
+
+Each `sbatch` call submits an array job with 3 tasks (seeds 0, 1, 2).
 
 ### Time Limits by Depth
 
@@ -330,42 +323,30 @@ ENV_ID="ant_big_maze" DEPTH=32 USE_LOW_RANK=1 LOW_RANK_DIM=64 sbatch job_low_ran
 | 16 | `12:00:00` |
 | 32 | `24:00:00` |
 
-Adjust `#SBATCH --time` accordingly for each depth to avoid wasting queue allocation.
+Adjust `#SBATCH --time` accordingly for each depth.
+
+## Implementation Details
+
+- **LoRA factorization**: Each `Dense(m→m)` in residual blocks → `Dense(m→r, no bias)` + `Dense(r→m, with bias)`
+- **Down-projection uses no bias** (LoRA convention)
+- **Up-projection uses bias**
+- **Initialization**: `lecun_uniform = variance_scaling(1/3, "fan_in", "uniform")` for both factors
+- **Parameter count**: Per factorized layer goes from `m² + m` to `mr + rm + m = 2mr + m`
+  - For m=256, r=64: from 65,792 → 32,832 params per layer (50% reduction)
+  - For a depth-16 network with 4 residual blocks × 4 layers = 16 factorized layers: ~527K fewer params
 
 ## Evaluating Results
 
-### Primary Metric: Time at Goal
-- Logged to W&B as `eval/episode_success` or similar eval metrics
-- Higher is better — measures how effectively the agent reaches and stays at the goal
-- Compare mean and std across 3 seeds
-
-### How to Compare
-1. **Training curves**: Plot eval metric vs. env_steps for baseline vs. low-rank at each depth
-2. **Final performance**: Compare mean ± std of final eval metric across seeds
-3. **Training speed**: Compare SPS (steps per second) — low-rank should be faster due to smaller matrices
-4. **Depth scaling**: Plot final performance vs. depth for both baseline and low-rank
-
 ### Key Comparisons
-- At each depth: does low-rank improve over baseline?
-- Across depths: does the improvement grow with depth?
-- Across r values: which bottleneck dimension works best?
-- Low-rank critic only vs. critic+actor: does actor low-rank help or hurt?
+
+1. **CRL + SiLU vs CRL + ReLU**: Does the activation function matter for CRL training dynamics?
+2. **CRL + ReLU vs CRL + ReLU + LoRA**: Does explicit low-rank constraint help when using ReLU?
+3. **Depth scaling**: Do the above effects change at different network depths?
 
 ### W&B Dashboard Setup
+
 Create a W&B project dashboard with:
-- **Panel 1**: Eval metric vs. env_steps, grouped by (depth, use_low_rank)
+- **Panel 1**: Eval metric vs. env_steps, grouped by (depth, baseline_type)
 - **Panel 2**: Final eval metric bar chart with error bars, grouped by configuration
 - **Panel 3**: Critic loss vs. env_steps, grouped by configuration
 - **Panel 4**: SPS comparison across configurations
-
-## Simplified Initialization Note
-
-The PyTorch reference implementation (`low_rank_res.py`) uses a sophisticated SVD-based initialization procedure:
-1. Train a full-rank MLP briefly
-2. Compute the gradient of the loss w.r.t. the first layer
-3. SVD decompose to find signal subspace
-4. Initialize V and U from the top singular vectors
-
-Our JAX implementation uses **epsilon-scaled orthogonal initialization** for the V and U projection layers instead. This is simpler and avoids the complexity of computing gradients in JAX's functional paradigm for a single initialization step. The `--low_rank_eps` flag (default 0.1) controls the scale.
-
-If initial results are promising, a follow-up experiment could implement the full SVD-based initialization in JAX using `jax.grad` and `jnp.linalg.svd`.
